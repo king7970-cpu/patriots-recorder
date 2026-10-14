@@ -1,0 +1,61 @@
+name: Record Patriots
+
+on:
+  schedule:
+    # 17:05 UTC = 20:05 Israel summer / 19:05 Israel winter. The script waits for the
+    # exact airtime from the Channel 14 schedule, so the early start just absorbs
+    # GitHub's occasional cron delays.
+    - cron: "5 17 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Test: record N minutes right now (empty = normal scheduled run)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Test without uploading to Drive"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: record
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg + rclone
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          curl -fsSL https://rclone.org/install.sh | sudo bash > /dev/null
+
+      - name: Record and upload
+        env:
+          RECORD_MINUTES: ${{ inputs.minutes }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          QUALITY: ${{ vars.QUALITY || '1' }}
+          DRIVE_FOLDER: ${{ vars.DRIVE_FOLDER || 'הפטריוטים' }}
+          KEEP_DAYS: ${{ vars.KEEP_DAYS || '3' }}
+          RCLONE_CONFIG_GDRIVE_TYPE: drive
+          RCLONE_CONFIG_GDRIVE_SCOPE: drive.file
+          RCLONE_CONFIG_GDRIVE_USE_TRASH: "false"
+          RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.RCLONE_DRIVE_TOKEN }}
+        run: python3 record.py
+
+      # GitHub pauses scheduled workflows after 60 days without commits — this keeps it alive.
+      - name: Keep-alive
+        if: always() && github.event_name == 'schedule'
+        run: |
+          date -u +"%Y-%m-%dT%H:%MZ ${{ job.status }}" > last-run.txt
+          git config user.name "patriots-recorder"
+          git config user.email "actions@users.noreply.github.com"
+          git add last-run.txt
+          git commit -qm "last run" && git push -q || true
