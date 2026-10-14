@@ -11,6 +11,7 @@ Env:
   PART_MINUTES     length of each uploaded part (default 30)
   HEIGHT, CRF      output size/compression (default 360p, CRF 30)
 """
+import base64
 import json
 import math
 import os
@@ -113,7 +114,16 @@ def compress_and_split(concat_list, work, name):
                   key=lambda f: int(f.rsplit(" ", 1)[1][:-4]))
 
 
+def normalize_rclone_token():
+    """rclone >= 1.70 `authorize` prints a base64 blob instead of the token JSON — accept both."""
+    t = os.environ.get("RCLONE_CONFIG_GDRIVE_TOKEN", "").strip()
+    if t and not t.startswith("{"):
+        blob = json.loads(base64.b64decode(t + "=" * (-len(t) % 4)))
+        os.environ["RCLONE_CONFIG_GDRIVE_TOKEN"] = blob["token"]
+
+
 def main():
+    normalize_rclone_token()
     quality = os.environ.get("QUALITY", "1")
     folder = os.environ.get("DRIVE_FOLDER", "הפטריוטים")
     keep_days = int(os.environ.get("KEEP_DAYS", "0") or 0)
