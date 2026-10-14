@@ -12,6 +12,10 @@ on:
         description: "Test: record N minutes right now (empty = normal scheduled run)"
         required: false
         default: ""
+      part_minutes:
+        description: "Length of each part in minutes"
+        required: false
+        default: "30"
       dry_run:
         description: "Test without uploading to Drive"
         type: boolean
@@ -43,6 +47,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           QUALITY: ${{ vars.QUALITY || '1' }}
           DRIVE_FOLDER: ${{ vars.DRIVE_FOLDER || 'הפטריוטים' }}
+          PART_MINUTES: ${{ inputs.part_minutes || '30' }}
           KEEP_DAYS: ${{ vars.KEEP_DAYS || '3' }}
           RCLONE_CONFIG_GDRIVE_TYPE: drive
           RCLONE_CONFIG_GDRIVE_SCOPE: drive.file

@@ -83,35 +83,40 @@ def stream_ok(url):
         return False
 
 
-def record(url, out, seconds, back_seconds):
+def start_recorder(url, pattern, seconds, back_seconds, first_part):
+    """Record the live stream, compressing on the fly into PART_MINUTES-long mp4 parts."""
+    part = PART_MINUTES * 60
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-user_agent", UA,
            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "30",
            "-http_persistent", "0"]
     if back_seconds > 0:
         # we're late — start from inside the stream's DVR buffer
         cmd += ["-live_start_index", str(-math.ceil(back_seconds / SEGMENT_SECONDS))]
-    cmd += ["-i", url, "-t", str(int(seconds)), "-c", "copy", "-f", "mpegts", "-y", out]
-    log("ffmpeg", " ".join(cmd[-9:]))
-    return subprocess.run(cmd).returncode
+    cmd += ["-i", url, "-t", str(int(seconds)),
+            "-vf", f"scale=-2:{HEIGHT},fps=25",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", str(CRF), "-profile:v", "main",
+            "-force_key_frames", f"expr:gte(t,n_forced*{part})",
+            "-c:a", "aac", "-b:a", "48k", "-ac", "1",
+            "-f", "segment", "-segment_time", str(part), "-reset_timestamps", "1",
+            "-segment_start_number", str(first_part), "-segment_format_options", "movflags=+faststart",
+            "-y", pattern]
+    log(f"ffmpeg {url} for {seconds/60:.0f} min, parts from {first_part}")
+    return subprocess.Popen(cmd)
 
 
-def compress_and_split(concat_list, work, name):
-    """Re-encode small for phone viewing and cut into PART_MINUTES pieces."""
-    part = PART_MINUTES * 60
-    pattern = f"{work}/{name} חלק %d.mp4"
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats_period", "60",
-           "-f", "concat", "-safe", "0", "-i", concat_list,
-           "-vf", f"scale=-2:{HEIGHT},fps=25",
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", str(CRF), "-profile:v", "main",
-           "-force_key_frames", f"expr:gte(t,n_forced*{part})",
-           "-c:a", "aac", "-b:a", "48k", "-ac", "1",
-           "-f", "segment", "-segment_time", str(part), "-reset_timestamps", "1",
-           "-segment_start_number", "1", "-segment_format_options", "movflags=+faststart",
-           "-y", pattern]
-    log("compressing + splitting into", PART_MINUTES, "min parts")
-    subprocess.run(cmd, check=True)
-    return sorted((f"{work}/{f}" for f in os.listdir(work) if f.endswith(".mp4")),
-                  key=lambda f: int(f.rsplit(" ", 1)[1][:-4]))
+def part_files(work):
+    files = [f for f in os.listdir(work) if f.endswith(".mp4")]
+    return sorted((f"{work}/{f}" for f in files), key=lambda f: int(f.rsplit(" ", 1)[1][:-4]))
+
+
+def upload(path, folder, dry_run):
+    mb = os.path.getsize(path) / 1e6
+    if dry_run:
+        log(f"(dry run) {os.path.basename(path)}: {mb:.0f} MB")
+        return
+    log(f"uploading {os.path.basename(path)}: {mb:.0f} MB")
+    subprocess.run(["rclone", "copy", path, f"gdrive:{folder}",
+                    "--drive-chunk-size", "64M", "--retries", "5", "-q"], check=True)
 
 
 def normalize_rclone_token():
@@ -160,6 +165,8 @@ def main():
     name = f"הפטריוטים {start:%Y-%m-%d}" + (" (בדיקה)" if test_minutes else "")
     work = "/tmp/rec"
     os.makedirs(work, exist_ok=True)
+    pattern = f"{work}/{name} חלק %d.mp4"
+    dry_run = os.environ.get("DRY_RUN") == "1"
     urls = [u.format(q=quality) for u in STREAMS]
     url = next((u for u in urls if stream_ok(u)), None)
     if not url:
@@ -167,35 +174,30 @@ def main():
         return 2
 
     log(f"recording {duration/60:.0f} min (from {back/60:.1f} min back) -> {name}")
-    rc = record(url, f"{work}/raw1.ts", duration, back)
-    # if the connection dropped early, record the remainder and join it afterwards
-    for n in range(2, 8):
-        remaining = (rec_end - datetime.now(TZ)).total_seconds()
-        if remaining < 60:
-            break
-        log(f"ffmpeg stopped early (rc={rc}); resuming as raw{n}")
-        rc = record(url, f"{work}/raw{n}.ts", remaining, 0)
+    sent = set()
+    proc = start_recorder(url, pattern, duration, back, 1)
+    restarts = 0
+    while True:
+        # every part except the one being written is finished — send it to Drive right away
+        done = part_files(work)[:-1] if proc.poll() is None else part_files(work)
+        for f in done:
+            if f not in sent:
+                upload(f, folder, dry_run)
+                sent.add(f)
+        if proc.poll() is not None:
+            remaining = (rec_end - datetime.now(TZ)).total_seconds()
+            if remaining < 60 or restarts >= 6:
+                break
+            # connection dropped early — continue into the next part number
+            restarts += 1
+            next_part = len(sent) + 1
+            log(f"ffmpeg stopped early (rc={proc.returncode}); resuming as part {next_part}")
+            proc = start_recorder(url, pattern, remaining, 0, next_part)
+        time.sleep(20)
 
-    raws = sorted((f for f in os.listdir(work) if f.startswith("raw") and os.path.getsize(f"{work}/{f}") > 0),
-                  key=lambda f: int(f[3:-3]))
-    if not raws:
+    if not sent:
         return 3
-    with open(f"{work}/list.txt", "w") as fh:
-        fh.writelines(f"file '{work}/{f}'\n" for f in raws)
-
-    files = compress_and_split(f"{work}/list.txt", work, name)
-    for f in files:
-        log(f"{os.path.basename(f)}: {os.path.getsize(f)/1e6:.0f} MB")
-    if not files:
-        return 4
-    if os.environ.get("DRY_RUN") == "1":
-        log("dry run — not uploading")
-        return 0
-
-    for f in files:
-        subprocess.run(["rclone", "copy", f, f"gdrive:{folder}",
-                        "--drive-chunk-size", "64M", "--retries", "5", "-v"], check=True)
-    log("uploaded to Drive folder:", folder)
+    log(f"done — {len(sent)} parts in Drive folder: {folder}")
 
     if keep_days > 0:
         subprocess.run(["rclone", "delete", f"gdrive:{folder}", "--min-age", f"{keep_days}d",
