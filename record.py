@@ -84,7 +84,8 @@ def stream_ok(url):
 
 def record(url, out, seconds, back_seconds):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-user_agent", UA,
-           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "30"]
+           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "30",
+           "-http_persistent", "0"]
     if back_seconds > 0:
         # we're late — start from inside the stream's DVR buffer
         cmd += ["-live_start_index", str(-math.ceil(back_seconds / SEGMENT_SECONDS))]
