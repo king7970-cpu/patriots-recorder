@@ -1,13 +1,19 @@
-name: Record Patriots
+name: Record Channel 14
 
 on:
   schedule:
-    # 17:05 UTC = 20:05 Israel summer / 19:05 Israel winter. The script waits for the
-    # exact airtime from the Channel 14 schedule, so the early start just absorbs
-    # GitHub's occasional cron delays.
-    - cron: "5 17 * * *"
+    # GitHub often starts cron runs hours late (or skips them), so fire early and twice.
+    # The script waits for airtime, and hands over to a fresh run if it would hit the job time limit.
+    # Duplicates exit right away when another run is already active.
+    - cron: "17 8 * * *"
+    - cron: "47 11 * * *"
   workflow_dispatch:
     inputs:
+      show:
+        description: "Which show (empty = all)"
+        type: choice
+        options: ["", patriots, news]
+        default: ""
       minutes:
         description: "Test: record N minutes right now (empty = normal scheduled run)"
         required: false
@@ -20,35 +26,48 @@ on:
         description: "Test without uploading to Drive"
         type: boolean
         default: false
+      relay:
+        description: "Internal: started by a previous run"
+        required: false
+        default: ""
 
 permissions:
   contents: write
-
-concurrency:
-  group: record
-  cancel-in-progress: false
+  actions: write
 
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        show: [news, patriots]
     steps:
+      - name: Skip shows not requested
+        id: pick
+        run: echo "go=${{ inputs.show == '' || inputs.show == matrix.show }}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
+        if: steps.pick.outputs.go == 'true'
 
       - name: Install ffmpeg + rclone
+        if: steps.pick.outputs.go == 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           curl -fsSL https://rclone.org/install.sh | sudo bash > /dev/null
 
       - name: Record and upload
+        if: steps.pick.outputs.go == 'true'
         env:
+          SHOW_ID: ${{ matrix.show }}
           RECORD_MINUTES: ${{ inputs.minutes }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
-          QUALITY: ${{ vars.QUALITY || '1' }}
-          DRIVE_FOLDER: ${{ vars.DRIVE_FOLDER || 'הפטריוטים' }}
           PART_MINUTES: ${{ inputs.part_minutes || '30' }}
+          QUALITY: ${{ vars.QUALITY || '1' }}
           KEEP_DAYS: ${{ vars.KEEP_DAYS || '3' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RCLONE_CONFIG_GDRIVE_TYPE: drive
           RCLONE_CONFIG_GDRIVE_SCOPE: drive.file
           RCLONE_CONFIG_GDRIVE_USE_TRASH: "false"
@@ -57,10 +76,10 @@ jobs:
 
       # GitHub pauses scheduled workflows after 60 days without commits — this keeps it alive.
       - name: Keep-alive
-        if: always() && github.event_name == 'schedule'
+        if: always() && github.event_name == 'schedule' && matrix.show == 'patriots'
         run: |
           date -u +"%Y-%m-%dT%H:%MZ ${{ job.status }}" > last-run.txt
           git config user.name "patriots-recorder"
           git config user.email "actions@users.noreply.github.com"
           git add last-run.txt
-          git commit -qm "last run" && git push -q || true
+          git commit -qm "last run" && (git pull -q --rebase; git push -q) || true
