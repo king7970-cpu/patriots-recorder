@@ -128,11 +128,12 @@ def github(method, path, body=None):
 
 
 def other_active_run(name):
-    """True if another run with this run-name is queued or in progress."""
-    me = os.environ.get("GITHUB_RUN_ID")
+    """True if an older run with this run-name is queued or in progress (the newer one yields,
+    so two runs starting together don't both exit)."""
+    me = int(os.environ.get("GITHUB_RUN_ID") or 0)
     for status in ("in_progress", "queued"):
         runs = github("GET", f"/actions/workflows/record.yml/runs?status={status}&per_page=50")
-        if any(str(r["id"]) != me and r.get("display_title") == name for r in runs["workflow_runs"]):
+        if any(r["id"] < me and r.get("display_title") == name for r in runs["workflow_runs"]):
             return True
     return False
 
