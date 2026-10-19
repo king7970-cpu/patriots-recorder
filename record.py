@@ -2,14 +2,20 @@
 Records Channel 14 shows from the live stream and uploads them to Google Drive.
 Runs on GitHub Actions — nothing touches the user's computer or home connection.
 
+Two modes:
+  SHOW_ID=scheduler  long-running coordinator: sleeps until 15 min before each airing and starts a
+                     recording run for it. Hands over to a fresh scheduler run before GitHub's
+                     job time limit. (GitHub's own cron is too unreliable — it skips/delays runs.)
+  SHOW_ID=<show>     record today's airing of that show.
+
 Env:
-  SHOW_ID          key in SHOWS (default "patriots")
   RECORD_MINUTES   if set, skip the schedule and record N minutes right now (test mode)
   QUALITY          0=240p, 1=360p, 2=720p  (default 1)
   KEEP_DAYS        delete recordings older than this from Drive; 0 = keep forever (default 0)
   DRY_RUN          "1" = don't upload
   PART_MINUTES     length of each uploaded part (default 30)
   HEIGHT, CRF      output size/compression (default 360p, CRF 30)
+  SINCE            scheduler: airings dispatched before this ISO time were already handled
 """
 import base64
 import json
@@ -19,31 +25,40 @@ import subprocess
 import sys
 import time
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Jerusalem")
-# keyword: matched against the Channel 14 schedule. fallback: (weekdays Mon=0..Sun=6, start, end) —
-# used when the schedule is unreachable (Cloudflare blocks GitHub's servers).
-SUN_THU = {6, 0, 1, 2, 3}
-SHOWS = {
-    "patriots": {"keyword": "פטריוט", "title": "הפטריוטים", "folder": "הפטריוטים",
-                 "fallback": (SUN_THU | {5}, "21:00", "22:30")},
-    "news": {"keyword": "טביבי", "title": "החדשות עם מגי טביבי", "folder": "החדשות - מגי טביבי",
-             "fallback": (SUN_THU, "19:50", "21:00")},
-}
-# GitHub kills a job after timeout-minutes (355); hand over to a fresh run before that.
-JOB_BUDGET = timedelta(minutes=330)
-RELAY_MARGIN = timedelta(minutes=12)
 EPG_URL = "https://www.c14.co.il/api-epg-klh.php"
 STREAMS = [
     "https://ch14channel14contentb-ioriver-cdn.encoders.immergo.tv/{q}/streamPlaylist.m3u8",
     "https://r.il.cdn-redge.media/livehls/oil/ch14/live/ch14/live.livx/playlist.m3u8",
 ]
+
+# keyword: matched against the Channel 14 schedule (EPG) when it's reachable — Cloudflare blocks
+# GitHub's servers, so in practice `slots` (exact dates) and then `weekly` are what get used.
+# after: ignore airings starting earlier than this (skips the overnight reruns).
+SUN_THU = {6, 0, 1, 2, 3}  # Python weekday(): Mon=0 .. Sun=6
+SHOWS = {
+    "noon": {"keyword": "חדשות צהריים", "title": "חדשות צהריים", "folder": "חדשות צהריים",
+             "after": "11:00", "weekly": (SUN_THU, "12:00", "13:00")},
+    "news": {"keyword": "טביבי", "title": "החדשות עם מגי טביבי", "folder": "החדשות - מגי טביבי",
+             "after": "17:00", "weekly": (SUN_THU, "19:50", "21:00")},
+    "patriots": {"keyword": "פטריוט", "title": "הפטריוטים", "folder": "הפטריוטים",
+                 "after": "17:00", "weekly": (SUN_THU | {5}, "21:00", "22:30")},
+    # 2026 Knesset campaign broadcasts — times vary nightly, taken from the EPG on 2026-10-19.
+    "election": {"keyword": "תעמולת", "title": "תעמולת בחירות", "folder": "תעמולת בחירות",
+                 "after": "20:00", "slots": {
+                     "2026-10-19": ("22:55", "23:22"), "2026-10-20": ("23:40", "00:20"),
+                     "2026-10-21": ("23:40", "00:18"), "2026-10-22": ("23:40", "00:31"),
+                     "2026-10-24": ("23:40", "00:25"), "2026-10-25": ("23:40", "00:50")}},
+}
 LEAD = timedelta(minutes=2)   # start before scheduled time
 TAIL = timedelta(minutes=8)   # keep going after scheduled end (shows run over)
+DISPATCH_LEAD = timedelta(minutes=15)  # scheduler starts a recording run this early
 SEGMENT_SECONDS = 6
 DVR_WINDOW = timedelta(minutes=85)  # stream keeps ~89 min back; stay inside it
+JOB_BUDGET = timedelta(minutes=330)  # GitHub kills jobs at timeout-minutes (355)
 PART_MINUTES = int(os.environ.get("PART_MINUTES", "30"))
 HEIGHT = int(os.environ.get("HEIGHT", "360"))  # output height in pixels
 CRF = int(os.environ.get("CRF", "30"))          # higher = smaller file, lower quality
@@ -54,36 +69,52 @@ def log(*a):
     print(datetime.now(TZ).strftime("%H:%M:%S"), *a, flush=True)
 
 
-def fetch_epg():
-    req = urllib.request.Request(EPG_URL, headers={"User-Agent": UA, "Referer": "https://www.c14.co.il/"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+# ---------- schedule ----------
+
+_epg = None
 
 
-def tonight_slot(now, show):
-    """Today's evening airing (not the overnight rerun). Returns (start, end) or None."""
-    today = now.date().isoformat()
-    try:
-        epg = fetch_epg()
-        for day in epg["shidurim"]:
-            for p in day.get(today, []):
-                if show["keyword"] in p["program"] and p["start"] >= "17:00":
-                    s = datetime.fromisoformat(f"{today}T{p['start']}").replace(tzinfo=TZ)
-                    e = datetime.fromisoformat(f"{today}T{p['end']}").replace(tzinfo=TZ)
-                    if e <= s:
-                        e += timedelta(days=1)
-                    log("EPG:", p["program"], p["start"], "-", p["end"])
-                    return s, e
-        log("EPG: no evening airing today")
+def epg():
+    global _epg
+    if _epg is None:
+        try:
+            req = urllib.request.Request(EPG_URL, headers={"User-Agent": UA, "Referer": "https://www.c14.co.il/"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            _epg = {k: v for day in data["shidurim"] for k, v in day.items()}
+        except Exception as ex:
+            log("EPG unavailable:", ex)
+            _epg = {}
+    return _epg
+
+
+def at(d, hhmm):
+    return datetime.fromisoformat(f"{d.isoformat()}T{hhmm}").replace(tzinfo=TZ)
+
+
+def span(d, start, end):
+    s, e = at(d, start), at(d, end)
+    return s, (e + timedelta(days=1) if e <= s else e)
+
+
+def slot(show, d):
+    """(start, end) of the show's airing on date d, or None."""
+    key = d.isoformat()
+    if key in epg():
+        for p in epg()[key]:
+            if show["keyword"] in p["program"] and p["start"] >= show["after"]:
+                return span(d, p["start"], p["end"])
         return None
-    except Exception as ex:  # EPG unreachable — fall back to the usual slot
-        log("EPG failed:", ex)
-        days, start, end = show["fallback"]
-        if now.weekday() not in days:
-            return None
-        s = datetime.fromisoformat(f"{today}T{start}").replace(tzinfo=TZ)
-        return s, datetime.fromisoformat(f"{today}T{end}").replace(tzinfo=TZ)
+    if key in show.get("slots", {}):
+        return span(d, *show["slots"][key])
+    if "weekly" in show:
+        days, start, end = show["weekly"]
+        if d.weekday() in days:
+            return span(d, start, end)
+    return None
 
+
+# ---------- GitHub ----------
 
 def github(method, path, body=None):
     req = urllib.request.Request(
@@ -96,29 +127,81 @@ def github(method, path, body=None):
         return json.loads(raw) if raw else None
 
 
-def another_run_active():
-    """True if a different run of this workflow is already on the job (scheduled duplicates)."""
+def other_active_run(name):
+    """True if another run with this run-name is queued or in progress."""
     me = os.environ.get("GITHUB_RUN_ID")
     for status in ("in_progress", "queued"):
-        runs = github("GET", f"/actions/workflows/record.yml/runs?status={status}&per_page=20")
-        if any(str(r["id"]) != me for r in runs["workflow_runs"]):
+        runs = github("GET", f"/actions/workflows/record.yml/runs?status={status}&per_page=50")
+        if any(str(r["id"]) != me and r.get("display_title") == name for r in runs["workflow_runs"]):
             return True
     return False
 
 
-def relay(show_id):
-    """Start a fresh run for this show. Manual dispatches start in seconds, unlike cron."""
+def dispatch(inputs):
     ref = os.environ.get("GITHUB_REF_NAME", "main")
-    github("POST", "/actions/workflows/record.yml/dispatches",
-           {"ref": ref, "inputs": {"show": show_id, "relay": "true"}})
-    log("handed over to a fresh run")
+    for attempt in range(5):
+        try:
+            github("POST", "/actions/workflows/record.yml/dispatches", {"ref": ref, "inputs": inputs})
+            return
+        except Exception as ex:
+            log("dispatch failed, retrying:", ex)
+            time.sleep(20)
+    raise RuntimeError("could not dispatch " + json.dumps(inputs))
 
 
-def already_in_drive(folder, prefix):
-    r = subprocess.run(["rclone", "lsf", f"gdrive:{folder}", "--include", f"{prefix} חלק 1.mp4"],
-                       capture_output=True, text=True)
-    return bool(r.stdout.strip())
+def sleep_until(t):
+    time.sleep(max(0.0, (t - datetime.now(TZ)).total_seconds()))
 
+
+# ---------- scheduler ----------
+
+def scheduler():
+    t0 = datetime.now(TZ)
+    since = os.environ.get("SINCE", "").strip()
+    if since:
+        handled_until = datetime.fromisoformat(since)
+    else:
+        # fresh start (cron / manual): make sure we're the only scheduler, and catch anything airing now
+        if other_active_run("scheduler"):
+            log("another scheduler is running — exiting")
+            return 0
+        handled_until = t0 - timedelta(hours=6)
+
+    while True:
+        now = datetime.now(TZ)
+        upcoming = []
+        for show_id, show in SHOWS.items():
+            for days in (-1, 0, 1, 2):
+                s = slot(show, now.date() + timedelta(days=days))
+                if not s or s[1] + TAIL < now:
+                    continue
+                go = s[0] - LEAD - DISPATCH_LEAD
+                if go > handled_until:
+                    upcoming.append((go, show_id, s))
+        upcoming.sort()
+        if not upcoming:
+            log("nothing scheduled in the next days")
+            nxt = None
+        else:
+            nxt = upcoming[0]
+            for go, sid, (s, e) in upcoming[:6]:
+                log(f"  next: {SHOWS[sid]['title']} {s:%a %d/%m %H:%M}-{e:%H:%M} (start run {go:%H:%M})")
+
+        deadline = t0 + JOB_BUDGET
+        if nxt is None or nxt[0] > deadline:
+            sleep_until(deadline)
+            log("handing the scheduler over to a fresh run")
+            dispatch({"show": "scheduler", "since": handled_until.isoformat()})
+            return 0
+
+        go, show_id, _ = nxt
+        sleep_until(go)
+        log(f"starting recording run: {show_id}")
+        dispatch({"show": show_id})
+        handled_until = go
+
+
+# ---------- recording ----------
 
 def stream_ok(url):
     try:
@@ -166,6 +249,12 @@ def upload(path, folder, dry_run):
                     "--drive-chunk-size", "64M", "--retries", "5", "-q"], check=True)
 
 
+def already_in_drive(folder, prefix):
+    r = subprocess.run(["rclone", "lsf", f"gdrive:{folder}", "--include", f"{prefix} חלק 1.mp4"],
+                       capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
 def normalize_rclone_token():
     """rclone >= 1.70 `authorize` prints a base64 blob instead of the token JSON — accept both."""
     t = os.environ.get("RCLONE_CONFIG_GDRIVE_TOKEN", "").strip()
@@ -174,10 +263,8 @@ def normalize_rclone_token():
         os.environ["RCLONE_CONFIG_GDRIVE_TOKEN"] = blob["token"]
 
 
-def main():
+def record_show(show_id):
     normalize_rclone_token()
-    t0 = datetime.now(TZ)
-    show_id = os.environ.get("SHOW_ID") or "patriots"
     show = SHOWS[show_id]
     folder = show["folder"]
     quality = os.environ.get("QUALITY", "1")
@@ -190,28 +277,25 @@ def main():
         start, end = now, now + timedelta(minutes=float(test_minutes))
         lead = tail = timedelta(0)
     else:
-        if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and another_run_active():
-            log("another run is already handling today — exiting")
+        if os.environ.get("GITHUB_RUN_ID") and other_active_run(show_id):
+            log(f"another {show_id} run is already recording — exiting")
             return 0
-        slot = tonight_slot(now, show)
-        if not slot:
-            log("nothing to record today")
+        # today's airing, or last night's if it runs past midnight
+        found = [s for s in (slot(show, now.date()), slot(show, now.date() - timedelta(days=1)))
+                 if s and s[1] + TAIL > now]
+        if not found:
+            log("nothing to record now")
             return 0
-        start, end = slot
+        start, end = found[0]
         lead, tail = LEAD, TAIL
 
     rec_start, rec_end = start - lead, end + tail
     name = f"{show['title']} {start:%Y-%m-%d}" + (" (בדיקה)" if test_minutes else "")
     if not test_minutes and not dry_run and already_in_drive(folder, name):
-        log("already recorded today — exiting")
+        log("already recorded — exiting")
         return 0
-
-    # Not enough job time left to wait and record? Sleep as long as is safe, then hand over.
-    if rec_end + timedelta(minutes=15) > t0 + JOB_BUDGET:
-        relay_at = min(t0 + JOB_BUDGET - RELAY_MARGIN, rec_start - RELAY_MARGIN)
-        log(f"{show['title']} {start:%H:%M}-{end:%H:%M}: too far off for this run, relaying at {relay_at:%H:%M}")
-        time.sleep(max(0.0, (relay_at - datetime.now(TZ)).total_seconds()))
-        relay(show_id)
+    if rec_start - now > JOB_BUDGET - (rec_end - rec_start) - timedelta(minutes=15):
+        log(f"{show['title']} starts {start:%H:%M} — too far off for one run; the scheduler will start it")
         return 0
 
     wait = (rec_start - datetime.now(TZ)).total_seconds()
@@ -227,7 +311,7 @@ def main():
     duration = (rec_end - now).total_seconds() + back
     if duration <= 60:
         log("show already over")
-        return 1
+        return 0
 
     work = "/tmp/rec"
     os.makedirs(work, exist_ok=True)
@@ -264,11 +348,12 @@ def main():
         return 3
     log(f"done — {len(sent)} parts in Drive folder: {folder}")
 
-    if keep_days > 0:
+    if keep_days > 0 and not dry_run:
         subprocess.run(["rclone", "delete", f"gdrive:{folder}", "--min-age", f"{keep_days}d",
                         "--include", "*.mp4", "-v"])
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sid = os.environ.get("SHOW_ID") or "scheduler"
+    sys.exit(scheduler() if sid == "scheduler" else record_show(sid))

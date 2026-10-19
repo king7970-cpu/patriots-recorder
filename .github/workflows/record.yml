@@ -1,21 +1,22 @@
 name: Record Channel 14
+run-name: ${{ inputs.show || 'scheduler' }}
 
 on:
   schedule:
-    # GitHub often starts cron runs hours late (or skips them), so fire early and twice.
-    # The script waits for airtime, and hands over to a fresh run if it would hit the job time limit.
-    # Duplicates exit right away when another run is already active.
-    - cron: "17 8 * * *"
-    - cron: "47 11 * * *"
+    # Backup only: restarts the scheduler if its chain ever breaks. (GitHub cron is unreliable —
+    # it skipped/delayed runs by hours — so the scheduler itself does the timing.)
+    - cron: "17 3 * * *"
+    - cron: "47 9 * * *"
+    - cron: "17 15 * * *"
   workflow_dispatch:
     inputs:
       show:
-        description: "Which show (empty = all)"
+        description: "scheduler, or a show to record now: noon, news, patriots, election"
         type: choice
-        options: ["", patriots, news]
-        default: ""
+        options: [scheduler, noon, news, patriots, election]
+        default: scheduler
       minutes:
-        description: "Test: record N minutes right now (empty = normal scheduled run)"
+        description: "Test: record N minutes right now (empty = the show's real airtime)"
         required: false
         default: ""
       part_minutes:
@@ -26,8 +27,12 @@ on:
         description: "Test without uploading to Drive"
         type: boolean
         default: false
+      since:
+        description: "Internal: scheduler hand-over state"
+        required: false
+        default: ""
       relay:
-        description: "Internal: started by a previous run"
+        description: "Internal (legacy)"
         required: false
         default: ""
 
@@ -36,32 +41,46 @@ permissions:
   actions: write
 
 jobs:
-  record:
+  scheduler:
+    if: github.event_name == 'schedule' || inputs.show == 'scheduler'
     runs-on: ubuntu-latest
     timeout-minutes: 355
-    strategy:
-      fail-fast: false
-      matrix:
-        show: [news, patriots]
     steps:
-      - name: Skip shows not requested
-        id: pick
-        run: echo "go=${{ inputs.show == '' || inputs.show == matrix.show }}" >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v4
-        if: steps.pick.outputs.go == 'true'
+
+      - name: Schedule recordings
+        env:
+          SHOW_ID: scheduler
+          SINCE: ${{ inputs.since }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 record.py
+
+      # GitHub pauses cron triggers after 60 days without commits — one commit a day keeps them alive.
+      - name: Keep-alive
+        if: always()
+        run: |
+          date -u +"%Y-%m-%d" > last-run.txt
+          git config user.name "patriots-recorder"
+          git config user.email "actions@users.noreply.github.com"
+          git add last-run.txt
+          git commit -qm "last run" && (git pull -q --rebase; git push -q) || true
+
+  record:
+    if: github.event_name == 'workflow_dispatch' && inputs.show != 'scheduler'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install ffmpeg + rclone
-        if: steps.pick.outputs.go == 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           curl -fsSL https://rclone.org/install.sh | sudo bash > /dev/null
 
       - name: Record and upload
-        if: steps.pick.outputs.go == 'true'
         env:
-          SHOW_ID: ${{ matrix.show }}
+          SHOW_ID: ${{ inputs.show }}
           RECORD_MINUTES: ${{ inputs.minutes }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           PART_MINUTES: ${{ inputs.part_minutes || '30' }}
@@ -73,13 +92,3 @@ jobs:
           RCLONE_CONFIG_GDRIVE_USE_TRASH: "false"
           RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.RCLONE_DRIVE_TOKEN }}
         run: python3 record.py
-
-      # GitHub pauses scheduled workflows after 60 days without commits — this keeps it alive.
-      - name: Keep-alive
-        if: always() && github.event_name == 'schedule' && matrix.show == 'patriots'
-        run: |
-          date -u +"%Y-%m-%dT%H:%MZ ${{ job.status }}" > last-run.txt
-          git config user.name "patriots-recorder"
-          git config user.email "actions@users.noreply.github.com"
-          git add last-run.txt
-          git commit -qm "last run" && (git pull -q --rebase; git push -q) || true
