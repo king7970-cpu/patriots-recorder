@@ -58,7 +58,7 @@ SHOWS = {
 }
 LEAD = timedelta(minutes=2)   # start before scheduled time
 TAIL = timedelta(minutes=8)   # keep going after scheduled end (shows run over)
-DISPATCH_LEAD = timedelta(minutes=15)  # scheduler starts a recording run this early
+DISPATCH_LEAD = timedelta(minutes=25)  # scheduler starts a recording run this early (GitHub may queue it; the stream keeps only ~30s back)
 SEGMENT_SECONDS = 6
 DVR_WINDOW = timedelta(minutes=85)  # stream keeps ~89 min back; stay inside it
 JOB_BUDGET = timedelta(minutes=330)  # GitHub kills jobs at timeout-minutes (355)
