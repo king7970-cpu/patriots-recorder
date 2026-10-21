@@ -27,6 +27,10 @@ on:
         description: "Test without uploading to Drive"
         type: boolean
         default: false
+      force:
+        description: "Re-record even if already running/recorded"
+        type: boolean
+        default: false
       since:
         description: "Internal: scheduler hand-over state"
         required: false
@@ -83,6 +87,7 @@ jobs:
           SHOW_ID: ${{ inputs.show }}
           RECORD_MINUTES: ${{ inputs.minutes }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          FORCE: ${{ inputs.force && '1' || '0' }}
           PART_MINUTES: ${{ inputs.part_minutes || '30' }}
           QUALITY: ${{ vars.QUALITY || '1' }}
           KEEP_DAYS: ${{ vars.KEEP_DAYS || '3' }}

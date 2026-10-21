@@ -296,12 +296,13 @@ def record_show(show_id):
     keep_days = int(os.environ.get("KEEP_DAYS", "0") or 0)
     now = datetime.now(TZ)
     test_minutes = os.environ.get("RECORD_MINUTES", "").strip()
+    force = os.environ.get("FORCE") == "1"  # re-record even if another run / Drive already has it
 
     if test_minutes:
         start, end = now, now + timedelta(minutes=float(test_minutes))
         lead = tail = timedelta(0)
     else:
-        if os.environ.get("GITHUB_RUN_ID") and other_active_run(show_id):
+        if not force and os.environ.get("GITHUB_RUN_ID") and other_active_run(show_id):
             log(f"another {show_id} run is already recording — exiting")
             return 0
         # today's airing, or last night's if it runs past midnight
@@ -315,7 +316,7 @@ def record_show(show_id):
 
     rec_start, rec_end = start - lead, end + tail
     name = f"{show['title']} {start:%Y-%m-%d}" + (" (בדיקה)" if test_minutes else "")
-    if not test_minutes and not dry_run and already_in_drive(folder, name):
+    if not test_minutes and not dry_run and not force and already_in_drive(folder, name):
         log("already recorded — exiting")
         return 0
     if rec_start - now > JOB_BUDGET - (rec_end - rec_start) - timedelta(minutes=15):
@@ -383,6 +384,14 @@ def record_show(show_id):
     if not sent:
         return 3
     log(f"done — {len(sent)} parts in Drive folder: {folder}")
+    if force and not dry_run:
+        # drop leftover higher-numbered parts from an earlier, broken attempt
+        r = subprocess.run(["rclone", "lsf", f"gdrive:{folder}", "--include", f"{name} חלק *.mp4"],
+                           capture_output=True, text=True)
+        for f in r.stdout.splitlines():
+            if f.strip() and int(f.rsplit(" ", 1)[1][:-4]) > len(sent):
+                subprocess.run(["rclone", "deletefile", f"gdrive:{folder}/{f.strip()}"])
+                log("removed leftover", f.strip())
 
     if keep_days > 0 and not dry_run:
         subprocess.run(["rclone", "delete", f"gdrive:{folder}", "--min-age", f"{keep_days}d",
