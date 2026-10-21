@@ -24,15 +24,18 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Jerusalem")
 EPG_URL = "https://www.c14.co.il/api-epg-klh.php"
+# Master playlists, tried in order. Since 2026-10-20 the immergo URL serves a frozen decoy
+# playlist (segments return the playlist itself), so every candidate is checked for real video.
 STREAMS = [
-    "https://ch14channel14contentb-ioriver-cdn.encoders.immergo.tv/{q}/streamPlaylist.m3u8",
     "https://r.il.cdn-redge.media/livehls/oil/ch14/live/ch14/live.livx/playlist.m3u8",
+    "https://ch14channel14contentb-ioriver-cdn.encoders.immergo.tv/{q}/streamPlaylist.m3u8",
 ]
 
 # keyword: matched against the Channel 14 schedule (EPG) when it's reachable — Cloudflare blocks
@@ -204,14 +207,34 @@ def scheduler():
 
 # ---------- recording ----------
 
-def stream_ok(url):
+def fetch(url, limit=None):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": "https://www.c14.co.il/"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.geturl(), r.read(limit) if limit else r.read()
+
+
+def resolve_stream(master):
+    """Pick the lowest-bitrate variant (we downscale anyway) and verify it serves real MPEG-TS.
+    Returns (media playlist URL, seconds of buffer it keeps) or None."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return r.status == 200 and b"#EXTM3U" in r.read(2000)
+        final, body = fetch(master)
+        text = body.decode("utf-8", "replace")
+        if "#EXT-X-STREAM-INF" in text:
+            lines = text.splitlines()
+            variants = [(int(l.split("BANDWIDTH=")[1].split(",")[0]), lines[i + 1].strip())
+                        for i, l in enumerate(lines) if l.startswith("#EXT-X-STREAM-INF") and "BANDWIDTH=" in l]
+            final, body = fetch(urllib.parse.urljoin(final, min(variants)[1]))
+            text = body.decode("utf-8", "replace")
+        segs = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")]
+        window = sum(float(l.split(":")[1].split(",")[0]) for l in text.splitlines() if l.startswith("#EXTINF"))
+        _, head = fetch(urllib.parse.urljoin(final, segs[-1]), 2000)
+        if not head or head[0] != 0x47:  # MPEG-TS sync byte
+            log("stream check failed (not video):", master)
+            return None
+        return final, window
     except Exception as ex:
-        log("stream check failed:", url, ex)
-        return False
+        log("stream check failed:", master, ex)
+        return None
 
 
 def start_recorder(url, pattern, seconds, back_seconds, first_part):
@@ -317,11 +340,22 @@ def record_show(show_id):
     work = "/tmp/rec"
     os.makedirs(work, exist_ok=True)
     pattern = f"{work}/{name} חלק %d.mp4"
-    urls = [u.format(q=quality) for u in STREAMS]
-    url = next((u for u in urls if stream_ok(u)), None)
+    def find_stream():
+        for u in STREAMS:
+            got = resolve_stream(u.format(q=quality))
+            if got:
+                return got
+        return None, 0
+
+    url, window = find_stream()
     if not url:
         log("no stream reachable")
         return 2
+    if back > window - 8:
+        if back > 30:
+            log(f"started {back/60:.1f} min late — the stream only keeps {window:.0f}s back")
+        duration -= back - max(0.0, window - 8)
+        back = max(0.0, window - 8)
 
     log(f"recording {duration/60:.0f} min (from {back/60:.1f} min back) -> {name}")
     sent = set()
@@ -342,6 +376,7 @@ def record_show(show_id):
             restarts += 1
             next_part = len(sent) + 1
             log(f"ffmpeg stopped early (rc={proc.returncode}); resuming as part {next_part}")
+            url = find_stream()[0] or url
             proc = start_recorder(url, pattern, remaining, 0, next_part)
         time.sleep(20)
 
