@@ -88,6 +88,7 @@ jobs:
           RECORD_MINUTES: ${{ inputs.minutes }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           FORCE: ${{ inputs.force && '1' || '0' }}
+          TEST_KILL_AFTER: ${{ inputs.minutes && vars.TEST_KILL_AFTER || '' }}
           PART_MINUTES: ${{ inputs.part_minutes || '30' }}
           QUALITY: ${{ vars.QUALITY || '1' }}
           KEEP_DAYS: ${{ vars.KEEP_DAYS || '3' }}

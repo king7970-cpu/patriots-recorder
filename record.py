@@ -60,6 +60,7 @@ LEAD = timedelta(minutes=2)   # start before scheduled time
 TAIL = timedelta(minutes=8)   # keep going after scheduled end (shows run over)
 DISPATCH_LEAD = timedelta(minutes=25)  # scheduler starts a recording run this early (GitHub may queue it; the stream keeps only ~30s back)
 SEGMENT_SECONDS = 6
+SHORT_PART = 300  # seconds: a part cut shorter than this by a stream error is merged into the next one
 DVR_WINDOW = timedelta(minutes=85)  # stream keeps ~89 min back; stay inside it
 JOB_BUDGET = timedelta(minutes=330)  # GitHub kills jobs at timeout-minutes (355)
 PART_MINUTES = int(os.environ.get("PART_MINUTES", "30"))
@@ -242,6 +243,7 @@ def start_recorder(url, pattern, seconds, back_seconds, first_part):
     part = PART_MINUTES * 60
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-user_agent", UA,
            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "30",
+           "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "5xx",
            "-http_persistent", "0"]
     if back_seconds > 0:
         # we're late — start from inside the stream's DVR buffer
@@ -258,9 +260,33 @@ def start_recorder(url, pattern, seconds, back_seconds, first_part):
     return subprocess.Popen(cmd)
 
 
+def part_no(path):
+    return int(path.rsplit(" ", 1)[1][:-4])
+
+
 def part_files(work):
-    files = [f for f in os.listdir(work) if f.endswith(".mp4")]
-    return sorted((f"{work}/{f}" for f in files), key=lambda f: int(f.rsplit(" ", 1)[1][:-4]))
+    return sorted((f"{work}/{f}" for f in os.listdir(work) if f.endswith(".mp4")), key=part_no)
+
+
+def duration_of(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                       capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def concat(first, second, out_dir):
+    """Join two parts (same encoding) into out_dir/<second's name>."""
+    os.makedirs(out_dir, exist_ok=True)
+    lst = f"{out_dir}/list.txt"
+    with open(lst, "w") as fh:
+        fh.write(f"file '{first}'\nfile '{second}'\n")
+    out = f"{out_dir}/{os.path.basename(second)}"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", lst,
+                    "-c", "copy", "-movflags", "+faststart", "-y", out], check=True)
+    return out
 
 
 def probe(path):
@@ -369,37 +395,68 @@ def record_show(show_id):
         back = max(0.0, window - 8)
 
     log(f"recording {duration/60:.0f} min (from {back/60:.1f} min back) -> {name}")
-    sent = set()
-    proc = start_recorder(url, pattern, duration, back, 1)
-    restarts = 0
+    # Each ffmpeg attempt writes into its own folder. If an attempt dies early, its unfinished last
+    # part is "carried" and joined onto the first part of the next attempt (same part number),
+    # so a hiccup doesn't leave a separate one-minute file in Drive.
+    sent, uploaded, carry, restarts, attempt = set(), set(), None, 0, 0
+    adir = f"{work}/a0"
+    os.makedirs(adir, exist_ok=True)
+    proc = start_recorder(url, f"{adir}/{name} חלק %d.mp4", duration, back, 1)
+    kill_at = time.time() + float(os.environ.get("TEST_KILL_AFTER") or 1e12)  # test: simulate a stream error
     while True:
-        # every part except the one being written is finished — send it to Drive right away
-        done = part_files(work)[:-1] if proc.poll() is None else part_files(work)
-        for f in done:
-            if f not in sent:
-                upload(f, folder, dry_run)
-                sent.add(f)
-        if proc.poll() is not None:
-            remaining = (rec_end - datetime.now(TZ)).total_seconds()
-            if remaining < 60 or restarts >= 6:
-                break
-            # connection dropped early — continue into the next part number
-            restarts += 1
-            next_part = len(sent) + 1
-            log(f"ffmpeg stopped early (rc={proc.returncode}); resuming as part {next_part}")
-            url = find_stream()[0] or url
-            proc = start_recorder(url, pattern, remaining, 0, next_part)
-        time.sleep(20)
+        if time.time() > kill_at and proc.poll() is None:
+            log("test: killing ffmpeg to simulate a stream error")
+            proc.terminate()
+            proc.wait()
+            kill_at = 1e12
+        running = proc.poll() is None
+        files = part_files(adir)
+        remaining = (rec_end - datetime.now(TZ)).total_seconds()
+        restart = not running and remaining >= 60 and restarts < 6
+        held = files[-1] if restart and files and duration_of(files[-1]) < SHORT_PART else None
+        # every part except the one being written (or held back) is finished — send it right away
+        for f in (files[:-1] if running else [f for f in files if f != held]):
+            if f in sent:
+                continue
+            out = f
+            if carry and part_no(carry) == part_no(f):
+                out = concat(carry, f, f"{work}/m{attempt}")
+                carry = None
+            upload(out, folder, dry_run)
+            sent.add(f)
+            uploaded.add(part_no(f))
+        if running:
+            time.sleep(5 if kill_at < 1e12 else 20)
+            continue
+        if not restart:
+            if carry:  # nothing came after it — upload it as it is
+                upload(carry, folder, dry_run)
+                uploaded.add(part_no(carry))
+            break
+        restarts += 1
+        if held:
+            carry = concat(carry, held, f"{work}/c{attempt}") if carry else held
+            next_part = part_no(held)
+        elif carry:
+            next_part = part_no(carry)
+        else:
+            next_part = max(uploaded, default=0) + 1
+        log(f"ffmpeg stopped early (rc={proc.returncode}); resuming as part {next_part}")
+        attempt += 1
+        adir = f"{work}/a{attempt}"
+        os.makedirs(adir, exist_ok=True)
+        url = find_stream()[0] or url
+        proc = start_recorder(url, f"{adir}/{name} חלק %d.mp4", remaining, 0, next_part)
 
-    if not sent:
+    if not uploaded:
         return 3
-    log(f"done — {len(sent)} parts in Drive folder: {folder}")
+    log(f"done — {len(uploaded)} parts in Drive folder: {folder}")
     if force and not dry_run:
         # drop leftover higher-numbered parts from an earlier, broken attempt
         r = subprocess.run(["rclone", "lsf", f"gdrive:{folder}", "--include", f"{name} חלק *.mp4"],
                            capture_output=True, text=True)
         for f in r.stdout.splitlines():
-            if f.strip() and int(f.rsplit(" ", 1)[1][:-4]) > len(sent):
+            if f.strip() and part_no(f.strip()) > max(uploaded):
                 subprocess.run(["rclone", "deletefile", f"gdrive:{folder}/{f.strip()}"])
                 log("removed leftover", f.strip())
 
