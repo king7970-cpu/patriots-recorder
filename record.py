@@ -263,8 +263,18 @@ def part_files(work):
     return sorted((f"{work}/{f}" for f in files), key=lambda f: int(f.rsplit(" ", 1)[1][:-4]))
 
 
+def probe(path):
+    """Container duration + first/last video timestamps, to catch broken timing."""
+    q = lambda *a: subprocess.run(["ffprobe", "-v", "error", *a, path], capture_output=True, text=True).stdout.strip()
+    dur = q("-show_entries", "format=duration", "-of", "csv=p=0")
+    pts = q("-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0").split()
+    sdur = q("-show_entries", "stream=codec_type,duration,start_time", "-of", "csv=p=0").replace(chr(10), " | ")
+    return f"format {dur}s, streams [{sdur}], video pts {pts[0] if pts else '?'}..{pts[-1] if pts else '?'} ({len(pts)} pkts)"
+
+
 def upload(path, folder, dry_run):
     mb = os.path.getsize(path) / 1e6
+    log(f"probe {os.path.basename(path)}: {probe(path)}")
     if dry_run:
         log(f"(dry run) {os.path.basename(path)}: {mb:.0f} MB")
         return
