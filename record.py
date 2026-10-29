@@ -409,6 +409,24 @@ def record_show(show_id):
     return 0
 
 
+def inspect():
+    """Debug: download the newest recordings from Drive and report their timing."""
+    normalize_rclone_token()
+    for show in SHOWS.values():
+        r = subprocess.run(["rclone", "lsl", f"gdrive:{show['folder']}"], capture_output=True, text=True)
+        print(f"== {show['folder']}", r.stdout, sep="\n", flush=True)
+        newest = sorted(r.stdout.splitlines(), key=lambda l: l.split()[1:3], reverse=True)[:2]
+        for line in newest:
+            name = line.split(None, 3)[3]
+            subprocess.run(["rclone", "copyto", f"gdrive:{show['folder']}/{name}", "/tmp/x.mp4"], check=True)
+            pts = [float(x) for x in subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
+                 "-of", "csv=p=0", "/tmp/x.mp4"], capture_output=True, text=True).stdout.split() if x != "N/A"]
+            gaps = sorted(((b - a, a) for a, b in zip(pts, pts[1:])), reverse=True)[:3]
+            print(f"{name}: {probe('/tmp/x.mp4')}; biggest gaps {[(round(g, 1), round(t, 1)) for g, t in gaps]}", flush=True)
+    return 0
+
+
 if __name__ == "__main__":
     sid = os.environ.get("SHOW_ID") or "scheduler"
-    sys.exit(scheduler() if sid == "scheduler" else record_show(sid))
+    sys.exit(scheduler() if sid == "scheduler" else inspect() if sid == "inspect" else record_show(sid))
